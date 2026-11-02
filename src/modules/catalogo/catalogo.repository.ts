@@ -61,8 +61,9 @@ async obtenerProductoPorSlug(slug: string): Promise<IProductoDetalle | null> {
     const tablas = result.recordsets as sql.IRecordSet<any>[];
     const producto = tablas[0]?.[0] || null;
     const variantes: IVarianteDetalle[] = (tablas[1] as IVarianteDetalle[]) || [];
+    const imagenes = tablas[2] || [];
 
-    return producto ? { ...producto, variantes } : null;
+    return producto ? { ...producto, variantes, imagenes } : null;
   }
 
   async crearProducto(input: CrearProductoInput) {
