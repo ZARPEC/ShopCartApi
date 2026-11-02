@@ -9,6 +9,7 @@ import { AppError } from "./shared/errors/AppError.js";
 import authRoutes from "./modules/auth/auth.routes.js";
 import catalogoRoutes from './modules/catalogo/catalogo.routes.js';
 import inventarioRoutes from './modules/inventario/inventario.routes.js';
+import carritoRoutes from './modules/carrito/carrito.routes.js';
 const app = express();
 
 // 1. Middlewares de seguridad (Sección 06: CORS configurado y cabeceras básicas)
@@ -25,6 +26,7 @@ app.use(cookieParser());
 app.use("/api/auth", authRoutes);
 app.use('/api/catalogo', catalogoRoutes);
 app.use('/api/inventario', inventarioRoutes);
+app.use('/api/carrito', carritoRoutes);
 
 // 2. Endpoint de salud que verifica la conexión a SQL Server mediante Stored Procedure
 app.get(
