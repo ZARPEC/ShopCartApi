@@ -32,3 +32,15 @@ Cumpliendo con RF-03 y RF-09, las tablas `dbo.MovimientoKardex` y `dbo.BitacoraA
 
 ### Rotación de Refresh Tokens y Detección de Reuso (RFC 6819)
 Cada sesión genera una `FamiliaToken` (UUID). Al solicitar un nuevo `accessToken` en `/api/auth/refresh`, el token actual se revoca y se emite un nuevo reemplazo. Si un atacante intenta reutilizar un token revocado, el sistema detecta la brecha e invalida automáticamente toda la familia de tokens activa, forzando un nuevo inicio de sesión.
+
+
+### Manejo Centralizado de Errores y Bitácora de Excepciones (`dbo.BitacoraError`)
+Cumpliendo con la Sección 05 (*"Manejo centralizado de errores con respuestas consistentes y códigos HTTP correctos"*), se implementó un sistema de observabilidad y diagnóstico dividido en dos niveles:
+* **Para el cliente (Frontend / Postman):** Respuestas limpias y seguras con códigos HTTP estándar (`400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `409 Conflict`, `500 Internal Server Error`). En caso de error 500, se enmascaran los detalles técnicos para no exponer rutas de disco ni la estructura interna de SQL Server.
+* **Para el desarrollador (Base de Datos):** Cualquier excepción capturada en bloques `catch` de Node.js o `BEGIN CATCH` de SQL Server se persiste automáticamente en `dbo.BitacoraError` mediante el Stored Procedure `dbo.SP_Sistema_RegistrarError`. La tabla almacena:
+  * `OrigenError`: Identifica si ocurrió en `'SQL_SP'`, `'BACKEND_SERVICIO'`, `'BACKEND_MIDDLEWARE'` o `'TAREA_PROGRAMADA'`.
+  * `ObjetoOMetodo` y `NumeroLinea`: Ubicación exacta en el código o Stored Procedure.
+  * `NumeroErrorSQL` y `EstadoErrorSQL`: Código nativo arrojado por el motor de SQL Server.
+  * `DetalleStackTrace`: Rastreo completo de la pila de llamadas (*stack trace*).
+  * `ParametrosContextoJson`: Payload o parámetros de entrada en formato JSON, sanitizados automáticamente por el middleware para redactar credenciales sensibles (`password`, `token`).
+* **Mapeo de errores `>= 50000` (User-Defined Errors):** Node.js detecta cuando una excepción proviene de un `THROW` intencional de una regla de negocio en SQL Server (código `>= 50000`), respondiendo con `409 Conflict` o `400 Bad Request` en lugar de tratarlo como un fallo no controlado del servidor (500).
