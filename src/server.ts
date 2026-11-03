@@ -3,7 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import cookieParser from "cookie-parser";
 import { env } from "./config/env.js";
-import { getDbPool, sql } from "./config/database.js";
+import { getDbPool } from "./config/database.js";
 import { errorHandler } from "./middlewares/error.middleware.js";
 import { AppError } from "./shared/errors/AppError.js";
 import authRoutes from "./modules/auth/auth.routes.js";
@@ -11,6 +11,7 @@ import catalogoRoutes from './modules/catalogo/catalogo.routes.js';
 import inventarioRoutes from './modules/inventario/inventario.routes.js';
 import carritoRoutes from './modules/carrito/carrito.routes.js';
 import checkoutRoutes from './modules/checkout/checkout.routes.js';
+import dashboardRoutes from './modules/dashboard/dashboard.routes.js';
 import { iniciarWorkerReservas } from './workers/reservas.worker.js';
 const app = express();
 
@@ -29,7 +30,7 @@ app.use('/api/catalogo', catalogoRoutes);
 app.use('/api/inventario', inventarioRoutes);
 app.use('/api/carrito', carritoRoutes);
 app.use('/api/checkout', checkoutRoutes);
-
+app.use('/api/dashboard', dashboardRoutes);
 
 //  Ruta no encontrada (404)
 app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -44,7 +45,7 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   );
 });
 
-// 4. Middleware centralizado de errores (guarda en dbo.BitacoraError)
+//  Middleware centralizado de errores (guarda en dbo.BitacoraError)
 app.use(errorHandler);
 
 const iniciarServidor = async (): Promise<void> => {

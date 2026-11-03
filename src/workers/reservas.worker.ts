@@ -1,16 +1,20 @@
-import {NextFunction } from "express";
+// src/workers/reservas.worker.ts
 import { CheckoutRepository } from '../modules/checkout/checkout.repository.js';
+import { getDbPool } from '../config/database.js';
+import { registrarErrorEnBD } from '../middlewares/error.middleware.js';
 
 export const iniciarWorkerReservas = () => {
   const checkoutRepo = new CheckoutRepository();
-  const INTERVALO_MS = 30000; // Se ejecuta cada 30 segundos
+  const INTERVALO_MS = 30000;
 
-  setInterval(async (next: NextFunction) => {
+  setInterval(async () => {
     try {
-      const liberadas = await checkoutRepo.liberarReservasVencidas();
-
+      await checkoutRepo.liberarReservasVencidas();
+      const pool = await getDbPool();
+      await pool.request().execute('dbo.SP_Carrito_MarcarCarritosAbandonados');
     } catch (error) {
-     next(error);
+      console.error('Error en worker:', error);
+      await registrarErrorEnBD(error, 'TAREA_PROGRAMADA', 'reservas.worker.ts');
     }
   }, INTERVALO_MS);
 };

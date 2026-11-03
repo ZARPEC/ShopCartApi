@@ -97,3 +97,23 @@ export const errorHandler = async (
     ...(detallesValidacion ? { errores: detallesValidacion } : {}),
   });
 };
+
+// Al final de src/middlewares/error.middleware.ts
+export const registrarErrorEnBD = async (error: unknown, origen = 'TAREA_PROGRAMADA', objeto = 'worker') => {
+  try {
+    const pool = await getDbPool();
+    const errObj = error instanceof Error ? error : new Error(String(error));
+
+    await pool
+      .request()
+      .input('CodigoModulo', sql.VarChar(40), 'SISTEMA')
+      .input('IDSeveridadError', sql.TinyInt, 2)
+      .input('OrigenError', sql.VarChar(30), origen)
+      .input('ObjetoOMetodo', sql.VarChar(200), objeto)
+      .input('MensajeError', sql.NVarChar(2000), errObj.message)
+      .input('DetalleStackTrace', sql.NVarChar(sql.MAX), errObj.stack ?? null)
+      .execute('dbo.SP_Sistema_RegistrarError');
+  } catch (dbErr) {
+    console.error('Fallo al registrar en BitacoraError:', dbErr);
+  }
+};
