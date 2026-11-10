@@ -15,4 +15,8 @@ router.get('/perfil', autenticar, controller.perfil);
 router.get('/solo-operador', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.perfil);
 router.get('/solo-admin', autenticar, autorizarRoles('ADMINISTRADOR'), controller.perfil);
 
+
+router.post('/empleados', autenticar, autorizarRoles('ADMINISTRADOR'), controller.crearEmpleado);
+router.get('/usuarios', autenticar, autorizarRoles('ADMINISTRADOR'), controller.listarUsuarios);
+router.patch('/usuarios/:id/estado', autenticar, autorizarRoles('ADMINISTRADOR'), controller.cambiarEstadoUsuario);
 export default router;

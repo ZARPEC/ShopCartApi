@@ -2,6 +2,9 @@ import { Request, Response, NextFunction } from 'express';
 import { AuthService } from './auth.service.js';
 import { LoginSchema, RegistroSchema } from './auth.schema.js';
 import { AppError } from '../../shared/errors/AppError.js';
+import { AuthRepository } from './auth.repository.js';
+import bcrypt from 'bcryptjs';
+import { env } from '../../config/env.js';
 
 export class AuthController {
   private service = new AuthService();
@@ -76,4 +79,49 @@ export class AuthController {
   perfil = async (req: Request, res: Response) => {
     res.status(200).json({ ok: true, usuario: req.usuario });
   };
+
+  crearEmpleado = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { idRol, nombres, apellidos, correoElectronico, telefono, password } = req.body;
+    const passwordHash = await bcrypt.hash(password, env.BCRYPT_SALT_ROUNDS);
+    const repo = new AuthRepository();
+    const empleado = await repo.crearEmpleado(
+      { idRol: Number(idRol), nombres, apellidos, correoElectronico, telefono, passwordHash },
+      req.usuario?.idUsuario ?? 1,
+      req.ip
+    );
+    res.status(201).json({ ok: true, empleado });
+  } catch (error) {
+    next(error);
+  }
+};
+
+listarUsuarios = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const buscar = req.query.buscar ? String(req.query.buscar) : undefined;
+    const rol = req.query.rol ? Number(req.query.rol) : undefined;
+    const repo = new AuthRepository();
+    const usuarios = await repo.listarUsuarios(buscar, rol);
+    res.status(200).json({ ok: true, usuarios });
+  } catch (error) {
+    next(error);
+  }
+};
+
+cambiarEstadoUsuario = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const idUsuarioTarget = Number(req.params.id);
+    const { activo } = req.body;
+    const repo = new AuthRepository();
+    const resultado = await repo.cambiarEstadoUsuario(
+      idUsuarioTarget,
+      Boolean(activo),
+      req.usuario?.idUsuario ?? 1,
+      req.ip
+    );
+    res.status(200).json({ ok: true, ...resultado });
+  } catch (error) {
+    next(error);
+  }
+};
 }

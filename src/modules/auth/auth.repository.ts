@@ -88,4 +88,58 @@ export class AuthRepository {
       .input("TokenHash", sql.VarChar(128), tokenHash)
       .execute("dbo.SP_Auth_RevocarRefreshToken");
   }
+
+  async crearEmpleado(
+    input: {
+      idRol: number;
+      nombres: string;
+      apellidos: string;
+      correoElectronico: string;
+      telefono?: string;
+      passwordHash: string;
+    },
+    idAdmin: number,
+    ip?: string,
+  ) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDRol", sql.TinyInt, input.idRol)
+      .input("Nombres", sql.NVarChar(100), input.nombres)
+      .input("Apellidos", sql.NVarChar(100), input.apellidos)
+      .input("CorreoElectronico", sql.VarChar(150), input.correoElectronico)
+      .input("Telefono", sql.VarChar(20), input.telefono ?? null)
+      .input("PasswordHash", sql.VarChar(255), input.passwordHash)
+      .input("IDUsuarioAdmin", sql.Int, idAdmin)
+      .input("DireccionIP", sql.VarChar(45), ip ?? null)
+      .execute("dbo.SP_Auth_CrearEmpleado");
+    return result.recordset[0];
+  }
+
+  async listarUsuarios(buscarTexto?: string, idRol?: number) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("BuscarTexto", sql.NVarChar(100), buscarTexto ?? null)
+      .input("IDRol", sql.TinyInt, idRol ?? null)
+      .execute("dbo.SP_Auth_ListarUsuarios");
+    return result.recordset;
+  }
+
+  async cambiarEstadoUsuario(
+    idUsuarioTarget: number,
+    activo: boolean,
+    idAdmin: number,
+    ip?: string,
+  ) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDUsuarioTarget", sql.Int, idUsuarioTarget)
+      .input("Activo", sql.Bit, activo ? 1 : 0)
+      .input("IDUsuarioAdmin", sql.Int, idAdmin)
+      .input("DireccionIP", sql.VarChar(45), ip ?? null)
+      .execute("dbo.SP_Auth_CambiarEstadoUsuario");
+    return result.recordset[0];
+  }
 }

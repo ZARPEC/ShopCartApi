@@ -9,6 +9,7 @@ export const ListarProductosQuerySchema = z.object({
     .string()
     .optional()
     .transform((val) => val === 'true'),
+  incluirInactivos: z.string().optional().transform((val) => val === 'true'),
   orden: z.enum(['precio_asc', 'precio_desc', 'nombre', 'recientes']).default('recientes'),
   pagina: z.coerce.number().int().positive().default(1),
   limite: z.coerce.number().int().positive().max(100).default(12),

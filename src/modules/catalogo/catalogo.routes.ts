@@ -15,5 +15,9 @@ router.post('/categorias', autenticar, autorizarRoles('ADMINISTRADOR'), controll
 router.post('/productos', autenticar, autorizarRoles('ADMINISTRADOR'), controller.crearProducto);
 router.post('/productos/:id/variantes', autenticar, autorizarRoles('ADMINISTRADOR', 'OPERADOR'), controller.crearVariante);
 router.patch('/productos/:id/desactivar', autenticar, autorizarRoles('ADMINISTRADOR'), controller.desactivarProducto);
-
+router.put('/productos/:id', autenticar, autorizarRoles('ADMINISTRADOR'), controller.actualizarProducto);
+router.put('/variantes/:idVariante', autenticar, autorizarRoles('ADMINISTRADOR'), controller.actualizarVariante);
+router.post('/productos/:id/imagenes', autenticar, autorizarRoles('ADMINISTRADOR'), controller.agregarImagen);
+router.delete('/imagenes/:idImagen', autenticar, autorizarRoles('ADMINISTRADOR'), controller.eliminarImagen);
+router.patch('/productos/:id/reactivar', autenticar, autorizarRoles('ADMINISTRADOR'), controller.reactivarProducto);
 export default router;
