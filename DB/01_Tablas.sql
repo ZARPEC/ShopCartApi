@@ -950,3 +950,15 @@ INSERT INTO dbo.ConfiguracionSistema (IDModuloSistema, Clave, Valor, TipoDato, V
 (1,  'AUTH_MAX_INTENTOS_FALLIDOS',        '5',     'INT',     3,   15,     N'Intentos fallidos de inicio de sesión antes de bloquear temporalmente la cuenta (RF-01 / Extra)'),
 (1,  'AUTH_TIEMPO_BLOQUEO_MINUTOS',       '15',    'INT',     1,   120,    N'Minutos que permanece bloqueada una cuenta tras superar los intentos fallidos de login');
 GO
+
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_BitacoraAuditoria_AccionValida')
+BEGIN
+    ALTER TABLE dbo.BitacoraAuditoria DROP CONSTRAINT CK_BitacoraAuditoria_AccionValida;
+END;
+GO
+
+ALTER TABLE dbo.BitacoraAuditoria ADD CONSTRAINT CK_BitacoraAuditoria_AccionValida CHECK (
+    Accion IN ('CREACION', 'MODIFICACION', 'DESACTIVACION', 'REACTIVACION', 'CAMBIO_PRECIO', 'AJUSTE_EXISTENCIA', 'CAMBIO_ESTADO', 'ELIMINACION', 'DEVOLUCION')
+);
+GO

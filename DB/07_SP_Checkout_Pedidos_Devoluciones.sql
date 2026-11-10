@@ -712,4 +712,851 @@ BEGIN
 
     SELECT COUNT(1) AS TotalReservasLiberadas FROM @ReservasExpiradas;
 END;
+
+
+CREATE OR ALTER PROCEDURE dbo.SP_Checkout_LiberarReserva
+    @IDCarrito INT,
+    @IDUsuario INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    -- Validar si hay reservas activas para este carrito
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.ReservaInventario 
+        WHERE IDCarrito = @IDCarrito AND IDEstadoReserva = 1 -- 1 = ACTIVA
+    )
+    BEGIN
+        SELECT 0 AS TotalReservasLiberadas, N'No hay reservas activas pendientes de liberar para este carrito.' AS Mensaje;
+        RETURN;
+    END;
+
+    BEGIN TRANSACTION;
+
+    -- 1. Restar la cantidad reservada en VarianteProducto para que vuelva a estar Disponible
+    UPDATE v
+    SET v.ExistenciaReservada = CASE 
+            WHEN (v.ExistenciaReservada - r.TotalApartado) < 0 THEN 0 
+            ELSE (v.ExistenciaReservada - r.TotalApartado) 
+        END,
+        v.FechaModificacion = SYSDATETIME()
+    FROM dbo.VarianteProducto v
+    INNER JOIN (
+        SELECT IDVarianteProducto, SUM(CantidadReservada) AS TotalApartado
+        FROM dbo.ReservaInventario
+        WHERE IDCarrito = @IDCarrito AND IDEstadoReserva = 1
+        GROUP BY IDVarianteProducto
+    ) r ON v.IDVarianteProducto = r.IDVarianteProducto;
+
+    -- 2. Marcar las reservas como LIBERADA_CANCELACION (Estado 4)
+    UPDATE dbo.ReservaInventario
+    SET IDEstadoReserva = 4, -- 4 = LIBERADA_CANCELACION
+        FechaResolucion = SYSDATETIME()
+    WHERE IDCarrito = @IDCarrito AND IDEstadoReserva = 1;
+
+    DECLARE @FilasLiberadas INT = @@ROWCOUNT;
+
+    COMMIT TRANSACTION;
+
+    SELECT @FilasLiberadas AS TotalReservasLiberadas, N'Existencias liberadas exitosamente. El stock vuelve a estar disponible.' AS Mensaje;
+END;
+GO
+
+
+/*==============================================================================
+  SP_Checkout_EliminarDireccion
+     Elimina de la libreta una dirección que pertenezca al usuario autenticado.
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Checkout_EliminarDireccion
+    @IDDireccionCliente INT,
+    @IDUsuario          INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.DireccionCliente 
+        WHERE IDDireccionCliente = @IDDireccionCliente AND IDUsuario = @IDUsuario
+    )
+    BEGIN
+        ;THROW 50015, N'La dirección no existe o no pertenece a tu cuenta.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    DELETE FROM dbo.DireccionCliente
+    WHERE IDDireccionCliente = @IDDireccionCliente AND IDUsuario = @IDUsuario;
+
+    -- Si se eliminó la predeterminada y quedan más direcciones, marcar la primera como predeterminada
+    IF NOT EXISTS (SELECT 1 FROM dbo.DireccionCliente WHERE IDUsuario = @IDUsuario AND EsPredeterminada = 1)
+    BEGIN
+        DECLARE @SiguienteDir INT;
+        SELECT TOP 1 @SiguienteDir = IDDireccionCliente 
+        FROM dbo.DireccionCliente 
+        WHERE IDUsuario = @IDUsuario 
+        ORDER BY IDDireccionCliente DESC;
+
+        IF @SiguienteDir IS NOT NULL
+        BEGIN
+            UPDATE dbo.DireccionCliente SET EsPredeterminada = 1 WHERE IDDireccionCliente = @SiguienteDir;
+        END;
+    END;
+
+    COMMIT TRANSACTION;
+
+    SELECT @IDDireccionCliente AS IDDireccionEliminada, N'Dirección eliminada exitosamente.' AS Mensaje;
+END;
+GO
+
+/*==============================================================================
+  SP_Checkout_EstablecerDireccionPredeterminada
+     Marca una dirección como la favorita/predeterminada para checkout.
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Checkout_EstablecerDireccionPredeterminada
+    @IDDireccionCliente INT,
+    @IDUsuario          INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.DireccionCliente 
+        WHERE IDDireccionCliente = @IDDireccionCliente AND IDUsuario = @IDUsuario
+    )
+    BEGIN
+        ;THROW 50015, N'La dirección no existe o no pertenece a tu cuenta.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    UPDATE dbo.DireccionCliente
+    SET EsPredeterminada = CASE WHEN IDDireccionCliente = @IDDireccionCliente THEN 1 ELSE 0 END
+    WHERE IDUsuario = @IDUsuario;
+
+    COMMIT TRANSACTION;
+
+    SELECT @IDDireccionCliente AS IDDireccionCliente, N'Dirección establecida como predeterminada.' AS Mensaje;
+END;
+GO
+
+
+CREATE OR ALTER PROCEDURE dbo.SP_Pedidos_ProcesarDevolucion
+    @IDPedido             INT,
+    @IDUsuarioOperador    INT,
+    @MotivoDevolucion     NVARCHAR(500),
+    @LineasJson           NVARCHAR(MAX), -- '[{"idPedidoDetalle": 1, "cantidad": 2}, ...]'
+    @DireccionIP          VARCHAR(45) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    SET @MotivoDevolucion = LTRIM(RTRIM(@MotivoDevolucion));
+
+    -- 1. Validaciones previas de estado
+    IF LEN(@MotivoDevolucion) < 5
+    BEGIN
+        ;THROW 50016, N'El motivo de devolución es obligatorio y debe tener al menos 5 caracteres.', 1;
+    END;
+
+    DECLARE @IDEstadoActual TINYINT;
+    DECLARE @NumeroPedido VARCHAR(30);
+    DECLARE @IDUsuarioCliente INT;
+    DECLARE @TotalPedido DECIMAL(12,2);
+    DECLARE @TotalDevueltoActual DECIMAL(12,2);
+
+    SELECT 
+        @IDEstadoActual     = IDEstadoPedido,
+        @NumeroPedido       = NumeroPedido,
+        @IDUsuarioCliente   = IDUsuario,
+        @TotalPedido        = TotalPedido,
+        @TotalDevueltoActual = TotalDevueltoAcumulado
+    FROM dbo.Pedido
+    WHERE IDPedido = @IDPedido;
+
+    IF @IDEstadoActual IS NULL
+    BEGIN
+        ;THROW 50017, N'El pedido especificado no existe.', 1;
+    END;
+
+    -- Solo se permiten devoluciones si el pedido está en ENTREGADO (4) o DEVUELTO_PARCIAL (5)
+    IF @IDEstadoActual NOT IN (4, 5)
+    BEGIN
+        ;THROW 50018, N'Solo se pueden procesar devoluciones sobre pedidos que ya fueron ENTREGADOS al cliente.', 1;
+    END;
+
+    -- 2. Tabla temporal para procesar las líneas solicitadas en JSON
+    DECLARE @LineasSolicitadas TABLE (
+        IDPedidoDetalle INT NOT NULL,
+        Cantidad        INT NOT NULL
+    );
+
+    INSERT INTO @LineasSolicitadas (IDPedidoDetalle, Cantidad)
+    SELECT 
+        CAST(JSON_VALUE(value, '$.idPedidoDetalle') AS INT),
+        CAST(JSON_VALUE(value, '$.cantidad') AS INT)
+    FROM OPENJSON(@LineasJson);
+
+    IF NOT EXISTS (SELECT 1 FROM @LineasSolicitadas WHERE Cantidad > 0)
+    BEGIN
+        ;THROW 50019, N'Debe indicar al menos una unidad a devolver en las líneas del pedido.', 1;
+    END;
+
+    -- Validar que ninguna línea supere la cantidad disponible para devolver
+    IF EXISTS (
+        SELECT 1 
+        FROM @LineasSolicitadas ls
+        INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+        WHERE pd.IDPedido = @IDPedido 
+          AND (ls.Cantidad < 0 OR ls.Cantidad > (pd.CantidadComprada - pd.CantidadDevuelta))
+    )
+    BEGIN
+        ;THROW 50020, N'La cantidad solicitada a devolver supera las unidades disponibles en una o más líneas.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    -- 3. Calcular montos reembolsados proporcionales y crear cabecera de Devolución
+    DECLARE @NuevoNumeroDevolucion VARCHAR(30);
+    DECLARE @SecuenciaHoy INT;
+    DECLARE @PrefijoFecha VARCHAR(10) = FORMAT(SYSDATETIME(), 'yyyyMMdd');
+
+    SELECT @SecuenciaHoy = COUNT(1) + 1 
+    FROM dbo.Devolucion 
+    WHERE NumeroDevolucion LIKE 'DEV-' + @PrefijoFecha + '-%';
+
+    SET @NuevoNumeroDevolucion = 'DEV-' + @PrefijoFecha + '-' + RIGHT('00000' + CAST(@SecuenciaHoy AS VARCHAR(5)), 5);
+
+    DECLARE @MontoTotalReembolsado DECIMAL(12,2) = 0.00;
+
+    -- Calcular reembolso basado en el precio neto unitario de la línea
+    SELECT @MontoTotalReembolsado = SUM(
+        CAST((pd.TotalNetaLinea / pd.CantidadComprada) * ls.Cantidad AS DECIMAL(12,2))
+    )
+    FROM @LineasSolicitadas ls
+    INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+    WHERE pd.IDPedido = @IDPedido AND ls.Cantidad > 0;
+
+    DECLARE @IDDevolucion INT;
+
+    INSERT INTO dbo.Devolucion (
+        NumeroDevolucion, IDPedido, IDEstadoDevolucion, MontoTotalReembolsado,
+        EsDevolucionTotal, MotivoDevolucion, IDUsuarioSolicita, IDUsuarioProcesa,
+        FechaSolicitud, FechaProcesamiento
+    )
+    VALUES (
+        @NuevoNumeroDevolucion, @IDPedido, 2, @MontoTotalReembolsado,
+        0, @MotivoDevolucion, @IDUsuarioCliente, @IDUsuarioOperador,
+        SYSDATETIME(), SYSDATETIME()
+    );
+
+    SET @IDDevolucion = SCOPE_IDENTITY();
+
+    -- 4. Insertar detalle de devolución y actualizar CantidadDevuelta en PedidoDetalle
+    INSERT INTO dbo.DevolucionDetalle (
+        IDDevolucion, IDPedidoDetalle, IDVarianteProducto, CantidadDevuelta, MontoReembolsadoLinea
+    )
+    SELECT 
+        @IDDevolucion,
+        pd.IDPedidoDetalle,
+        pd.IDVarianteProducto,
+        ls.Cantidad,
+        CAST((pd.TotalNetaLinea / pd.CantidadComprada) * ls.Cantidad AS DECIMAL(12,2))
+    FROM @LineasSolicitadas ls
+    INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+    WHERE pd.IDPedido = @IDPedido AND ls.Cantidad > 0;
+
+    UPDATE pd
+    SET pd.CantidadDevuelta = pd.CantidadDevuelta + ls.Cantidad
+    FROM dbo.PedidoDetalle pd
+    INNER JOIN @LineasSolicitadas ls ON pd.IDPedidoDetalle = ls.IDPedidoDetalle
+    WHERE pd.IDPedido = @IDPedido AND ls.Cantidad > 0;
+
+    -- 5. Reintegrar cada variante física al inventario y registrar movimiento en Kardex 
+    DECLARE @IDVarianteLoop INT;
+    DECLARE @CantidadLoop INT;
+    DECLARE @MontoLineaLoop DECIMAL(12,2);
+    DECLARE @SKULoop VARCHAR(50);
+    DECLARE @CostoUnitarioLoop DECIMAL(12,2);
+    DECLARE @ExistenciaActualLoop INT;
+    DECLARE @ExistenciaNuevaLoop INT;
+
+    DECLARE curDevolucion CURSOR LOCAL FAST_FORWARD FOR
+        SELECT 
+            pd.IDVarianteProducto,
+            v.SKU,
+            ls.Cantidad,
+            CAST((pd.TotalNetaLinea / pd.CantidadComprada) * ls.Cantidad AS DECIMAL(12,2)),
+            v.CostoReferencia,
+            v.ExistenciaFisica
+        FROM @LineasSolicitadas ls
+        INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+        INNER JOIN dbo.VarianteProducto v ON pd.IDVarianteProducto = v.IDVarianteProducto
+        WHERE pd.IDPedido = @IDPedido AND ls.Cantidad > 0;
+
+    OPEN curDevolucion;
+    FETCH NEXT FROM curDevolucion INTO @IDVarianteLoop, @SKULoop, @CantidadLoop, @MontoLineaLoop, @CostoUnitarioLoop, @ExistenciaActualLoop;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @ExistenciaNuevaLoop = @ExistenciaActualLoop + @CantidadLoop;
+
+        -- Actualizar existencia física en VarianteProducto
+        UPDATE dbo.VarianteProducto
+        SET ExistenciaFisica = @ExistenciaNuevaLoop,
+            FechaModificacion = SYSDATETIME()
+        WHERE IDVarianteProducto = @IDVarianteLoop;
+
+        -- Registrar movimiento inmutable de entrada por devolución en Kardex (Tipo 4)
+        INSERT INTO dbo.MovimientoKardex (
+            IDVarianteProducto,
+            IDTipoMovimientoKardex,
+            IDPedido,
+            IDDevolucion,
+            IDUsuario,
+            Cantidad,
+            FactorSigno,
+            ExistenciaAnterior,
+            ExistenciaNueva,
+            CostoUnitario,
+            Motivo
+        )
+        VALUES (
+            @IDVarianteLoop,
+            4, -- 4 = ENTRADA_DEVOLUCION
+            @IDPedido,
+            @IDDevolucion,
+            @IDUsuarioOperador,
+            @CantidadLoop,
+            1, -- Suma al saldo
+            @ExistenciaActualLoop,
+            @ExistenciaNuevaLoop,
+            @CostoUnitarioLoop,
+            CONCAT(N'Reintegro de stock por Devolución ', @NuevoNumeroDevolucion, N' en Pedido ', @NumeroPedido, N': ', @MotivoDevolucion)
+        );
+
+        FETCH NEXT FROM curDevolucion INTO @IDVarianteLoop, @SKULoop, @CantidadLoop, @MontoLineaLoop, @CostoUnitarioLoop, @ExistenciaActualLoop;
+    END;
+
+    CLOSE curDevolucion;
+    DEALLOCATE curDevolucion;
+
+    -- 6. Actualizar acumulado de devoluciones en Pedido y determinar si es parcial o total
+    DECLARE @TotalArticulosOriginales INT;
+    DECLARE @TotalArticulosDevueltos INT;
+
+    SELECT 
+        @TotalArticulosOriginales = SUM(CantidadComprada),
+        @TotalArticulosDevueltos  = SUM(CantidadDevuelta)
+    FROM dbo.PedidoDetalle
+    WHERE IDPedido = @IDPedido;
+
+    DECLARE @NuevoEstadoPedido TINYINT;
+    DECLARE @EsDevolucionTotal BIT = 0;
+
+    IF @TotalArticulosDevueltos >= @TotalArticulosOriginales
+    BEGIN
+        SET @NuevoEstadoPedido = 6; -- 6 = DEVUELTO_TOTAL
+        SET @EsDevolucionTotal = 1;
+        UPDATE dbo.Devolucion SET EsDevolucionTotal = 1 WHERE IDDevolucion = @IDDevolucion;
+    END
+    ELSE
+    BEGIN
+        SET @NuevoEstadoPedido = 5; -- 5 = DEVUELTO_PARCIAL
+        SET @EsDevolucionTotal = 0;
+    END;
+
+    UPDATE dbo.Pedido
+    SET TotalDevueltoAcumulado = TotalDevueltoAcumulado + @MontoTotalReembolsado,
+        IDEstadoPedido         = @NuevoEstadoPedido,
+        FechaModificacion      = SYSDATETIME()
+    WHERE IDPedido = @IDPedido;
+
+    -- Registrar auditoría del evento
+    DECLARE @IDModuloPedidos TINYINT = (SELECT IDModuloSistema FROM dbo.ModuloSistema WHERE Codigo = 'PEDIDOS');
+
+    INSERT INTO dbo.BitacoraAuditoria (
+        IDModuloSistema, IDUsuario, Entidad, IDRegistroEntidad,
+        Accion, ResumenCambio, ValorAnteriorJson, ValorNuevoJson, DireccionIP
+    )
+    VALUES (
+        ISNULL(@IDModuloPedidos, 5),
+        @IDUsuarioOperador,
+        'Pedido',
+        CAST(@IDPedido AS VARCHAR(100)),
+        'DEVOLUCION',
+        CONCAT(N'Devolución ', @NuevoNumeroDevolucion, N' aplicada a Pedido ', @NumeroPedido, N' por Q ', @MontoTotalReembolsado, N'. Nuevo estado: ', CASE WHEN @NuevoEstadoPedido = 6 THEN 'DEVUELTO_TOTAL' ELSE 'DEVUELTO_PARCIAL' END),
+        (SELECT @IDEstadoActual AS EstadoAnterior, @TotalDevueltoActual AS TotalDevueltoAnterior FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        (SELECT @NuevoEstadoPedido AS EstadoNuevo, (@TotalDevueltoActual + @MontoTotalReembolsado) AS TotalDevueltoNuevo, @MontoTotalReembolsado AS MontoReembolsado FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        @DireccionIP
+    );
+
+    COMMIT TRANSACTION;
+
+    SELECT 
+        @IDDevolucion AS IDDevolucion,
+        @NuevoNumeroDevolucion AS NumeroDevolucion,
+        @IDPedido AS IDPedido,
+        @NuevoEstadoPedido AS NuevoIDEstadoPedido,
+        CASE WHEN @NuevoEstadoPedido = 6 THEN N'Devuelto Total' ELSE N'Devuelto Parcial' END AS NuevoEstadoNombre,
+        @MontoTotalReembolsado AS MontoReembolsado,
+        @EsDevolucionTotal AS EsDevolucionTotal,
+        N'Devolución procesada exitosamente y existencias reintegradas al Kardex.' AS Mensaje;
+END;
+GO
+
+
+/*==============================================================================
+  PROYECTO:        Tech Challenge 360 - Reto ShopCart (Grupo Pentandra)
+  ARCHIVO:         19_SP_Devoluciones_Flujo_Dos_Pasos.sql
+  DESCRIPCIÓN:     Flujo logístico en 2 pasos para Devoluciones (RF-07):
+                   Paso 1: El cliente solicita devolución (Estado 1 - SOLICITADA, sin mover stock).
+                   Paso 2: El operador en bodega aprueba e ingresa al Kardex (Estado 2 - APROBADA)
+                           o rechaza con justificación (Estado 3 - RECHAZADA).
+==============================================================================*/
+
+USE ShopCartDB;
+GO
+
+/*==============================================================================
+  SP_Pedidos_SolicitarDevolucionCliente (Paso 1: Cliente genera solicitud)
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Pedidos_SolicitarDevolucionCliente
+    @IDPedido         INT,
+    @IDUsuarioCliente INT,
+    @MotivoDevolucion NVARCHAR(500),
+    @LineasJson       NVARCHAR(MAX),
+    @DireccionIP      VARCHAR(45) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    SET @MotivoDevolucion = LTRIM(RTRIM(@MotivoDevolucion));
+
+    IF LEN(@MotivoDevolucion) < 5
+    BEGIN
+        ;THROW 50016, N'El motivo de devolución es obligatorio y debe tener al menos 5 caracteres.', 1;
+    END;
+
+    DECLARE @IDEstadoPedido TINYINT;
+    DECLARE @IDUsuarioDuenio INT;
+    DECLARE @NumeroPedido VARCHAR(30);
+
+    SELECT 
+        @IDEstadoPedido  = IDEstadoPedido,
+        @IDUsuarioDuenio = IDUsuario,
+        @NumeroPedido    = NumeroPedido
+    FROM dbo.Pedido
+    WHERE IDPedido = @IDPedido;
+
+    IF @IDEstadoPedido IS NULL
+    BEGIN
+        ;THROW 50017, N'El pedido especificado no existe.', 1;
+    END;
+
+    IF @IDUsuarioDuenio <> @IDUsuarioCliente
+    BEGIN
+        ;THROW 50014, N'No tienes autorización para solicitar devolución sobre este pedido.', 1;
+    END;
+
+    IF @IDEstadoPedido NOT IN (4, 5) -- 4 = ENTREGADO, 5 = DEVUELTO_PARCIAL
+    BEGIN
+        ;THROW 50018, N'Solo se pueden solicitar devoluciones sobre pedidos que ya hayan sido entregados.', 1;
+    END;
+
+    -- Verificar que no tenga ya una solicitud abierta pendiente de revisión
+    IF EXISTS (
+        SELECT 1 FROM dbo.Devolucion 
+        WHERE IDPedido = @IDPedido AND IDEstadoDevolucion = 1 -- 1 = SOLICITADA
+    )
+    BEGIN
+        ;THROW 50021, N'Ya existe una solicitud de devolución pendiente de revisión para este pedido.', 1;
+    END;
+
+    DECLARE @LineasSolicitadas TABLE (
+        IDPedidoDetalle INT NOT NULL,
+        Cantidad        INT NOT NULL
+    );
+
+    INSERT INTO @LineasSolicitadas (IDPedidoDetalle, Cantidad)
+    SELECT 
+        CAST(JSON_VALUE(value, '$.idPedidoDetalle') AS INT),
+        CAST(JSON_VALUE(value, '$.cantidad') AS INT)
+    FROM OPENJSON(@LineasJson);
+
+    IF NOT EXISTS (SELECT 1 FROM @LineasSolicitadas WHERE Cantidad > 0)
+    BEGIN
+        ;THROW 50019, N'Debe indicar al menos una unidad a devolver.', 1;
+    END;
+
+    IF EXISTS (
+        SELECT 1 
+        FROM @LineasSolicitadas ls
+        INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+        WHERE pd.IDPedido = @IDPedido 
+          AND (ls.Cantidad < 0 OR ls.Cantidad > (pd.CantidadComprada - pd.CantidadDevuelta))
+    )
+    BEGIN
+        ;THROW 50020, N'La cantidad solicitada supera las unidades disponibles para devolución.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    DECLARE @NuevoNumeroDevolucion VARCHAR(30);
+    DECLARE @SecuenciaHoy INT;
+    DECLARE @PrefijoFecha VARCHAR(10) = FORMAT(SYSDATETIME(), 'yyyyMMdd');
+
+    SELECT @SecuenciaHoy = COUNT(1) + 1 
+    FROM dbo.Devolucion 
+    WHERE NumeroDevolucion LIKE 'DEV-' + @PrefijoFecha + '-%';
+
+    SET @NuevoNumeroDevolucion = 'DEV-' + @PrefijoFecha + '-' + RIGHT('00000' + CAST(@SecuenciaHoy AS VARCHAR(5)), 5);
+
+    DECLARE @MontoTotalReembolsado DECIMAL(12,2) = 0.00;
+
+    SELECT @MontoTotalReembolsado = SUM(
+        CAST((pd.TotalNetaLinea / pd.CantidadComprada) * ls.Cantidad AS DECIMAL(12,2))
+    )
+    FROM @LineasSolicitadas ls
+    INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+    WHERE pd.IDPedido = @IDPedido AND ls.Cantidad > 0;
+
+    DECLARE @IDDevolucion INT;
+
+    -- Se crea en estado 1 (SOLICITADA). 
+    INSERT INTO dbo.Devolucion (
+        NumeroDevolucion, IDPedido, IDEstadoDevolucion, MontoTotalReembolsado,
+        EsDevolucionTotal, MotivoDevolucion, IDUsuarioSolicita, IDUsuarioProcesa,
+        FechaSolicitud, FechaProcesamiento
+    )
+    VALUES (
+        @NuevoNumeroDevolucion, @IDPedido, 1, @MontoTotalReembolsado,
+        0, @MotivoDevolucion, @IDUsuarioCliente, NULL,
+        SYSDATETIME(), NULL
+    );
+
+    SET @IDDevolucion = SCOPE_IDENTITY();
+
+    INSERT INTO dbo.DevolucionDetalle (
+        IDDevolucion, IDPedidoDetalle, IDVarianteProducto, CantidadDevuelta, MontoReembolsadoLinea
+    )
+    SELECT 
+        @IDDevolucion,
+        pd.IDPedidoDetalle,
+        pd.IDVarianteProducto,
+        ls.Cantidad,
+        CAST((pd.TotalNetaLinea / pd.CantidadComprada) * ls.Cantidad AS DECIMAL(12,2))
+    FROM @LineasSolicitadas ls
+    INNER JOIN dbo.PedidoDetalle pd ON ls.IDPedidoDetalle = pd.IDPedidoDetalle
+    WHERE pd.IDPedido = @IDPedido AND ls.Cantidad > 0;
+
+    COMMIT TRANSACTION;
+
+    SELECT 
+        @IDDevolucion AS IDDevolucion,
+        @NuevoNumeroDevolucion AS NumeroDevolucion,
+        @IDPedido AS IDPedido,
+        @MontoTotalReembolsado AS MontoEstimadoReembolso,
+        1 AS IDEstadoDevolucion,
+        N'Solicitada' AS EstadoDevolucionNombre,
+        N'Solicitud de devolución registrada con éxito. Pendiente de recepción física en bodega.' AS Mensaje;
+END;
+GO
+
+/*==============================================================================
+  SP_Devoluciones_ListarPendientes (Para el Dashboard del Operador / Admin)
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Devoluciones_ListarPendientes
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT 
+        d.IDDevolucion,
+        d.NumeroDevolucion,
+        d.IDPedido,
+        p.NumeroPedido,
+        d.FechaSolicitud,
+        CONCAT(u.Nombres, ' ', u.Apellidos) AS ClienteNombre,
+        u.CorreoElectronico AS ClienteCorreo,
+        u.Telefono AS ClienteTelefono,
+        d.MontoTotalReembolsado,
+        d.MotivoDevolucion,
+        d.IDEstadoDevolucion,
+        ed.Nombre AS EstadoDevolucionNombre,
+        (
+            SELECT 
+                dd.IDDevolucionDetalle,
+                dd.CantidadDevuelta,
+                dd.MontoReembolsadoLinea,
+                v.SKU,
+                prod.Nombre AS NombreProducto,
+                v.NombreVariante
+            FROM dbo.DevolucionDetalle dd
+            INNER JOIN dbo.VarianteProducto v ON dd.IDVarianteProducto = v.IDVarianteProducto
+            INNER JOIN dbo.Producto prod ON v.IDProducto = prod.IDProducto
+            WHERE dd.IDDevolucion = d.IDDevolucion
+            FOR JSON PATH
+        ) AS LineasDevolucionJson
+    FROM dbo.Devolucion d
+    INNER JOIN dbo.EstadoDevolucion ed ON d.IDEstadoDevolucion = ed.IDEstadoDevolucion
+    INNER JOIN dbo.Pedido p ON d.IDPedido = p.IDPedido
+    INNER JOIN dbo.Usuario u ON d.IDUsuarioSolicita = u.IDUsuario
+    WHERE d.IDEstadoDevolucion = 1 -- 1 = SOLICITADA
+    ORDER BY d.FechaSolicitud ASC;
+END;
+GO
+
+/*==============================================================================
+  SP_Devoluciones_Aprobar 
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Devoluciones_Aprobar
+    @IDDevolucion         INT,
+    @IDUsuarioOperador    INT,
+    @DireccionIP          VARCHAR(45) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @IDEstadoDevolucion TINYINT;
+    DECLARE @IDPedido INT;
+    DECLARE @NumeroDevolucion VARCHAR(30);
+    DECLARE @NumeroPedido VARCHAR(30);
+    DECLARE @MontoReembolso DECIMAL(12,2);
+    DECLARE @MotivoDevolucion NVARCHAR(500);
+
+    SELECT 
+        @IDEstadoDevolucion = d.IDEstadoDevolucion,
+        @IDPedido           = d.IDPedido,
+        @NumeroDevolucion   = d.NumeroDevolucion,
+        @NumeroPedido       = p.NumeroPedido,
+        @MontoReembolso     = d.MontoTotalReembolsado,
+        @MotivoDevolucion   = d.MotivoDevolucion
+    FROM dbo.Devolucion d
+    INNER JOIN dbo.Pedido p ON d.IDPedido = p.IDPedido
+    WHERE d.IDDevolucion = @IDDevolucion;
+
+    IF @IDEstadoDevolucion IS NULL
+    BEGIN
+        ;THROW 50022, N'La devolución especificada no existe.', 1;
+    END;
+
+    IF @IDEstadoDevolucion <> 1
+    BEGIN
+        ;THROW 50023, N'Solo se pueden aprobar devoluciones que estén en estado SOLICITADA.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    -- 1. Actualizar CantidadDevuelta en PedidoDetalle
+    UPDATE pd
+    SET pd.CantidadDevuelta = pd.CantidadDevuelta + dd.CantidadDevuelta
+    FROM dbo.PedidoDetalle pd
+    INNER JOIN dbo.DevolucionDetalle dd ON pd.IDPedidoDetalle = dd.IDPedidoDetalle
+    WHERE dd.IDDevolucion = @IDDevolucion;
+
+    -- 2. Reingresar existencias físicas a VarianteProducto y crear movimientos en Kardex
+    DECLARE @IDVarianteLoop INT;
+    DECLARE @CantidadLoop INT;
+    DECLARE @MontoLineaLoop DECIMAL(12,2);
+    DECLARE @SKULoop VARCHAR(50);
+    DECLARE @CostoUnitarioLoop DECIMAL(12,2);
+    DECLARE @ExistenciaActualLoop INT;
+    DECLARE @ExistenciaNuevaLoop INT;
+
+    DECLARE curAprobarDev CURSOR LOCAL FAST_FORWARD FOR
+        SELECT 
+            dd.IDVarianteProducto,
+            v.SKU,
+            dd.CantidadDevuelta,
+            dd.MontoReembolsadoLinea,
+            v.CostoReferencia,
+            v.ExistenciaFisica
+        FROM dbo.DevolucionDetalle dd
+        INNER JOIN dbo.VarianteProducto v ON dd.IDVarianteProducto = v.IDVarianteProducto
+        WHERE dd.IDDevolucion = @IDDevolucion;
+
+    OPEN curAprobarDev;
+    FETCH NEXT FROM curAprobarDev INTO @IDVarianteLoop, @SKULoop, @CantidadLoop, @MontoLineaLoop, @CostoUnitarioLoop, @ExistenciaActualLoop;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @ExistenciaNuevaLoop = @ExistenciaActualLoop + @CantidadLoop;
+
+        -- Subir stock físico en almacén
+        UPDATE dbo.VarianteProducto
+        SET ExistenciaFisica = @ExistenciaNuevaLoop,
+            FechaModificacion = SYSDATETIME()
+        WHERE IDVarianteProducto = @IDVarianteLoop;
+
+        -- Registrar movimiento inmutable en Kardex (Tipo 4 = ENTRADA_DEVOLUCION)
+        INSERT INTO dbo.MovimientoKardex (
+            IDVarianteProducto,
+            IDTipoMovimientoKardex,
+            IDPedido,
+            IDDevolucion,
+            IDUsuario,
+            Cantidad,
+            FactorSigno,
+            ExistenciaAnterior,
+            ExistenciaNueva,
+            CostoUnitario,
+            Motivo
+        )
+        VALUES (
+            @IDVarianteLoop,
+            4, -- 4 = ENTRADA_DEVOLUCION
+            @IDPedido,
+            @IDDevolucion,
+            @IDUsuarioOperador,
+            @CantidadLoop,
+            1, -- Suma al stock físico
+            @ExistenciaActualLoop,
+            @ExistenciaNuevaLoop,
+            @CostoUnitarioLoop,
+            CONCAT(N'Reingreso aprobado de stock por Devolución ', @NumeroDevolucion, N' en Pedido ', @NumeroPedido, N': ', @MotivoDevolucion)
+        );
+
+        FETCH NEXT FROM curAprobarDev INTO @IDVarianteLoop, @SKULoop, @CantidadLoop, @MontoLineaLoop, @CostoUnitarioLoop, @ExistenciaActualLoop;
+    END;
+
+    CLOSE curAprobarDev;
+    DEALLOCATE curAprobarDev;
+
+    -- 3. Calcular si el pedido queda en DEVUELTO_PARCIAL (5) o DEVUELTO_TOTAL (6)
+    DECLARE @TotalOriginales INT;
+    DECLARE @TotalDevueltos INT;
+
+    SELECT 
+        @TotalOriginales = SUM(CantidadComprada),
+        @TotalDevueltos  = SUM(CantidadDevuelta)
+    FROM dbo.PedidoDetalle
+    WHERE IDPedido = @IDPedido;
+
+    DECLARE @NuevoEstadoPedido TINYINT;
+    DECLARE @EsDevolucionTotal BIT = 0;
+
+    IF @TotalDevueltos >= @TotalOriginales
+    BEGIN
+        SET @NuevoEstadoPedido = 6; -- 6 = DEVUELTO_TOTAL
+        SET @EsDevolucionTotal = 1;
+    END
+    ELSE
+    BEGIN
+        SET @NuevoEstadoPedido = 5; -- 5 = DEVUELTO_PARCIAL
+        SET @EsDevolucionTotal = 0;
+    END;
+
+    -- Actualizar cabecera de Devolución a 2 (APROBADA)
+    UPDATE dbo.Devolucion
+    SET IDEstadoDevolucion = 2, -- 2 = APROBADA
+        EsDevolucionTotal  = @EsDevolucionTotal,
+        IDUsuarioProcesa   = @IDUsuarioOperador,
+        FechaProcesamiento    = SYSDATETIME()
+    WHERE IDDevolucion = @IDDevolucion;
+
+    -- Actualizar Pedido
+    UPDATE dbo.Pedido
+    SET TotalDevueltoAcumulado = TotalDevueltoAcumulado + @MontoReembolso,
+        IDEstadoPedido         = @NuevoEstadoPedido,
+        FechaModificacion      = SYSDATETIME()
+    WHERE IDPedido = @IDPedido;
+
+    -- Registrar auditoría inmutable
+    DECLARE @IDModuloPedidos TINYINT = (SELECT IDModuloSistema FROM dbo.ModuloSistema WHERE Codigo = 'PEDIDOS');
+
+    INSERT INTO dbo.BitacoraAuditoria (
+        IDModuloSistema, IDUsuario, Entidad, IDRegistroEntidad,
+        Accion, ResumenCambio, ValorAnteriorJson, ValorNuevoJson, DireccionIP
+    )
+    VALUES (
+        ISNULL(@IDModuloPedidos, 5),
+        @IDUsuarioOperador,
+        'Devolucion',
+        CAST(@IDDevolucion AS VARCHAR(100)),
+        'APROBACION_DEVOLUCION',
+        CONCAT(N'Aprobación y reingreso a Kardex de Devolución ', @NumeroDevolucion, N' en Pedido ', @NumeroPedido, N' por Q ', @MontoReembolso),
+        (SELECT 1 AS EstadoDevolucionAnterior FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        (SELECT 2 AS EstadoDevolucionNuevo, @NuevoEstadoPedido AS NuevoEstadoPedido FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        @DireccionIP
+    );
+
+    COMMIT TRANSACTION;
+
+    SELECT 
+        @IDDevolucion AS IDDevolucion,
+        @NumeroDevolucion AS NumeroDevolucion,
+        @IDPedido AS IDPedido,
+        @NuevoEstadoPedido AS NuevoIDEstadoPedido,
+        CASE WHEN @NuevoEstadoPedido = 6 THEN N'Devuelto Total' ELSE N'Devuelto Parcial' END AS NuevoEstadoNombre,
+        @MontoReembolso AS MontoReembolsado,
+        N'Devolución aprobada exitosamente y existencias físicas reingresadas al Kardex.' AS Mensaje;
+END;
+GO
+
+/*==============================================================================
+  SP_Devoluciones_Rechazar
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Devoluciones_Rechazar
+    @IDDevolucion         INT,
+    @IDUsuarioOperador    INT,
+    @MotivoRechazo        NVARCHAR(500),
+    @DireccionIP          VARCHAR(45) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    SET @MotivoRechazo = LTRIM(RTRIM(@MotivoRechazo));
+
+    IF LEN(@MotivoRechazo) < 5
+    BEGIN
+        ;THROW 50024, N'Debe indicar un motivo justificado de rechazo de al menos 5 caracteres.', 1;
+    END;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.Devolucion 
+        WHERE IDDevolucion = @IDDevolucion AND IDEstadoDevolucion = 1
+    )
+    BEGIN
+        ;THROW 50023, N'La devolución no existe o ya no se encuentra en estado SOLICITADA.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    UPDATE dbo.Devolucion
+    SET IDEstadoDevolucion = 3, -- 3 = RECHAZADA
+        MotivoDevolucion   = CONCAT(MotivoDevolucion, N' | Rechazo operador: ', @MotivoRechazo),
+        IDUsuarioProcesa   = @IDUsuarioOperador,
+        FechaProcesamiento    = SYSDATETIME()
+    WHERE IDDevolucion = @IDDevolucion;
+
+    -- Registrar auditoría
+    DECLARE @IDModuloPedidos TINYINT = (SELECT IDModuloSistema FROM dbo.ModuloSistema WHERE Codigo = 'PEDIDOS');
+
+    INSERT INTO dbo.BitacoraAuditoria (
+        IDModuloSistema, IDUsuario, Entidad, IDRegistroEntidad,
+        Accion, ResumenCambio, ValorAnteriorJson, ValorNuevoJson, DireccionIP
+    )
+    VALUES (
+        ISNULL(@IDModuloPedidos, 5),
+        @IDUsuarioOperador,
+        'Devolucion',
+        CAST(@IDDevolucion AS VARCHAR(100)),
+        'RECHAZO_DEVOLUCION',
+        CONCAT(N'Rechazo de solicitud de devolución ID #', @IDDevolucion, N': ', @MotivoRechazo),
+        (SELECT 1 AS EstadoDevolucionAnterior FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        (SELECT 3 AS EstadoDevolucionNuevo, @MotivoRechazo AS MotivoRechazo FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        @DireccionIP
+    );
+
+    COMMIT TRANSACTION;
+
+    SELECT @IDDevolucion AS IDDevolucion, 3 AS IDEstadoDevolucion, N'Rechazada' AS EstadoNombre, N'Solicitud de devolución rechazada exitosamente.' AS Mensaje;
+END;
 GO

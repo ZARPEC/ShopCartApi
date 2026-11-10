@@ -301,3 +301,290 @@ BEGIN
       AND FechaRevocacion IS NULL;
 END;
 GO
+
+/*==============================================================================
+  SP_Auth_CrearEmpleado (Solo Administrador)
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Auth_CrearEmpleado
+    @IDRol             TINYINT,       -- 2 = OPERADOR, 3 = ADMINISTRADOR
+    @Nombres           NVARCHAR(100),
+    @Apellidos         NVARCHAR(100),
+    @CorreoElectronico VARCHAR(150),
+    @Telefono          VARCHAR(20)    = NULL,
+    @PasswordHash      VARCHAR(255),
+    @IDUsuarioAdmin    INT            = 1,
+    @DireccionIP       VARCHAR(45)    = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    SET @CorreoElectronico = LOWER(LTRIM(RTRIM(@CorreoElectronico)));
+
+    -- Validar que el rol sea empleado (2 = Operador, 3 = Administrador)
+    IF @IDRol NOT IN (2, 3)
+    BEGIN
+        ;THROW 50005, N'El rol especificado para el empleado no es válido (solo Operador o Administrador).', 1;
+    END;
+
+    IF EXISTS (SELECT 1 FROM dbo.Usuario WHERE CorreoElectronico = @CorreoElectronico)
+    BEGIN
+        ;THROW 50001, N'El correo electrónico ya se encuentra registrado en el sistema.', 1;
+    END;
+
+    DECLARE @NuevoIDUsuario INT;
+
+    BEGIN TRANSACTION;
+
+    INSERT INTO dbo.Usuario (
+        IDRol, Nombres, Apellidos, CorreoElectronico, Telefono, PasswordHash, Activo
+    )
+    VALUES (
+        @IDRol, LTRIM(RTRIM(@Nombres)), LTRIM(RTRIM(@Apellidos)), @CorreoElectronico, @Telefono, @PasswordHash, 1
+    );
+
+    SET @NuevoIDUsuario = SCOPE_IDENTITY();
+
+    -- Registrar auditoría inmutable de creación de empleado (RF-09)
+    DECLARE @IDModuloAuth TINYINT = (SELECT IDModuloSistema FROM dbo.ModuloSistema WHERE Codigo = 'AUTENTICACION');
+    DECLARE @NombreRol NVARCHAR(50) = (SELECT Nombre FROM dbo.Rol WHERE IDRol = @IDRol);
+
+    INSERT INTO dbo.BitacoraAuditoria (
+        IDModuloSistema, IDUsuario, Entidad, IDRegistroEntidad,
+        Accion, ResumenCambio, ValorAnteriorJson, ValorNuevoJson, DireccionIP
+    )
+    VALUES (
+        ISNULL(@IDModuloAuth, 1),
+        @IDUsuarioAdmin,
+        'Usuario',
+        CAST(@NuevoIDUsuario AS VARCHAR(100)),
+        'CREACION',
+        CONCAT(N'Creación de empleado ', @Nombres, N' ', @Apellidos, N' con rol ', @NombreRol, N' (', @CorreoElectronico, N')'),
+        NULL,
+        (SELECT @NuevoIDUsuario AS IDUsuario, @IDRol AS IDRol, @NombreRol AS Rol, @CorreoElectronico AS Correo FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        @DireccionIP
+    );
+
+    COMMIT TRANSACTION;
+
+    SELECT 
+        u.IDUsuario,
+        u.IDRol,
+        r.Codigo AS CodigoRol,
+        r.Nombre AS NombreRol,
+        u.Nombres,
+        u.Apellidos,
+        u.CorreoElectronico,
+        u.Telefono,
+        u.Activo,
+        u.FechaCreacion
+    FROM dbo.Usuario u
+    INNER JOIN dbo.Rol r ON u.IDRol = r.IDRol
+    WHERE u.IDUsuario = @NuevoIDUsuario;
+END;
+GO
+
+/*==============================================================================
+  SP_Auth_ListarUsuarios (Búsqueda y filtro por rol para el panel Admin)
+==============================================================================*/
+
+CREATE OR ALTER PROCEDURE dbo.SP_Auth_ListarUsuarios
+    @BuscarTexto NVARCHAR(100) = NULL,
+    @IDRol       TINYINT       = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT 
+        u.IDUsuario,
+        u.IDRol,
+        r.Codigo AS CodigoRol,
+        r.Nombre AS NombreRol,
+        u.Nombres,
+        u.Apellidos,
+        u.CorreoElectronico,
+        u.Telefono,
+        u.Activo,
+        u.IntentosFallidosLogin,
+        u.BloqueadoHasta,
+        u.FechaCreacion,
+        u.UltimoAcceso
+    FROM dbo.Usuario u
+    INNER JOIN dbo.Rol r ON u.IDRol = r.IDRol
+    WHERE (@IDRol IS NULL OR u.IDRol = @IDRol)
+      AND (
+          @BuscarTexto IS NULL 
+          OR u.Nombres LIKE '%' + @BuscarTexto + '%' 
+          OR u.Apellidos LIKE '%' + @BuscarTexto + '%' 
+          OR u.CorreoElectronico LIKE '%' + @BuscarTexto + '%'
+      )
+    ORDER BY u.IDRol DESC, u.FechaCreacion DESC;
+END;
+GO
+
+
+
+/*==============================================================================
+  3. SP_Auth_CambiarEstadoUsuario (Desactivar o reactivar acceso a empleados)
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Auth_CambiarEstadoUsuario
+    @IDUsuarioTarget INT,
+    @Activo          BIT,
+    @IDUsuarioAdmin  INT         = 1,
+    @DireccionIP     VARCHAR(45) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @IDUsuarioTarget = @IDUsuarioAdmin AND @Activo = 0
+    BEGIN
+        THROW 50006, N'No puedes desactivar tu propia cuenta de Administrador.', 1;
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.Usuario WHERE IDUsuario = @IDUsuarioTarget)
+    BEGIN
+        THROW 50007, N'El usuario especificado no existe.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    UPDATE dbo.Usuario
+    SET Activo = @Activo,
+        FechaModificacion = SYSDATETIME()
+    WHERE IDUsuario = @IDUsuarioTarget;
+
+    -- Si se desactiva, revocar de inmediato todos sus refresh tokens de sesión
+    IF @Activo = 0
+    BEGIN
+        UPDATE dbo.RefreshToken
+        SET FechaRevocacion = SYSDATETIME(),
+            MotivoRevocacion = N'Cuenta desactivada por el Administrador'
+        WHERE IDUsuario = @IDUsuarioTarget
+          AND FechaRevocacion IS NULL;
+    END;
+
+    DECLARE @IDModuloAuth TINYINT = (SELECT IDModuloSistema FROM dbo.ModuloSistema WHERE Codigo = 'AUTENTICACION');
+    DECLARE @Accion VARCHAR(40) = CASE WHEN @Activo = 1 THEN 'REACTIVACION' ELSE 'DESACTIVACION' END;
+
+    INSERT INTO dbo.BitacoraAuditoria (
+        IDModuloSistema, IDUsuario, Entidad, IDRegistroEntidad,
+        Accion, ResumenCambio, ValorAnteriorJson, ValorNuevoJson, DireccionIP
+    )
+    VALUES (
+        ISNULL(@IDModuloAuth, 1),
+        @IDUsuarioAdmin,
+        'Usuario',
+        CAST(@IDUsuarioTarget AS VARCHAR(100)),
+        @Accion,
+        CONCAT(N'Cambio de estado del usuario ID #', @IDUsuarioTarget, N' a: ', CASE WHEN @Activo = 1 THEN 'ACTIVO' ELSE 'INACTIVO' END),
+        (SELECT CASE WHEN @Activo = 1 THEN 0 ELSE 1 END AS Activo FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        (SELECT @Activo AS Activo FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        @DireccionIP
+    );
+
+    COMMIT TRANSACTION;
+
+    SELECT IDUsuario, Activo, N'Estado del usuario actualizado exitosamente.' AS Mensaje
+    FROM dbo.Usuario
+    WHERE IDUsuario = @IDUsuarioTarget;
+END;
+GO
+
+/*==============================================================================
+  SP_Auth_ActualizarPerfil
+     Permite al usuario editar sus nombres, apellidos y teléfono.
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Auth_ActualizarPerfil
+    @IDUsuario  INT,
+    @Nombres    NVARCHAR(100),
+    @Apellidos  NVARCHAR(100),
+    @Telefono   VARCHAR(20) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.Usuario WHERE IDUsuario = @IDUsuario AND Activo = 1)
+    BEGIN
+        ;THROW 50007, N'Usuario no encontrado o inactivo.', 1;
+    END;
+
+    UPDATE dbo.Usuario
+    SET Nombres           = LTRIM(RTRIM(@Nombres)),
+        Apellidos         = LTRIM(RTRIM(@Apellidos)),
+        Telefono          = @Telefono,
+        FechaModificacion = SYSDATETIME()
+    WHERE IDUsuario = @IDUsuario;
+
+    SELECT 
+        u.IDUsuario,
+        u.Nombres,
+        u.Apellidos,
+        CONCAT(u.Nombres, ' ', u.Apellidos) AS NombreCompleto,
+        u.CorreoElectronico,
+        u.Telefono,
+        r.Codigo AS Rol
+    FROM dbo.Usuario u
+    INNER JOIN dbo.Rol r ON u.IDRol = r.IDRol
+    WHERE u.IDUsuario = @IDUsuario;
+END;
+GO
+
+/*==============================================================================
+  SP_Auth_CambiarPassword
+     Actualiza la contraseña hasheada del usuario y revoca sus refresh tokens anteriores.
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.SP_Auth_CambiarPassword
+    @IDUsuario          INT,
+    @NuevoPasswordHash  VARCHAR(255)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.Usuario WHERE IDUsuario = @IDUsuario AND Activo = 1)
+    BEGIN
+        ;THROW 50007, N'Usuario no encontrado o inactivo.', 1;
+    END;
+
+    BEGIN TRANSACTION;
+
+    UPDATE dbo.Usuario
+    SET PasswordHash      = @NuevoPasswordHash,
+        FechaModificacion = SYSDATETIME()
+    WHERE IDUsuario = @IDUsuario;
+
+    -- Revocar todos los refresh tokens previos por seguridad
+    UPDATE dbo.RefreshToken
+    SET FechaRevocacion = SYSDATETIME(),
+        MotivoRevocacion = N'Cambio voluntario de contraseña por el usuario'
+    WHERE IDUsuario = @IDUsuario AND FechaRevocacion IS NULL;
+
+    COMMIT TRANSACTION;
+
+    SELECT @IDUsuario AS IDUsuario, N'Contraseña actualizada exitosamente.' AS Mensaje;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.SP_Auth_ObtenerUsuarioPorId
+    @IDUsuario INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT 
+        u.IDUsuario,
+        u.Nombres,
+        u.Apellidos,
+        CONCAT(u.Nombres, ' ', u.Apellidos) AS NombreCompleto,
+        u.CorreoElectronico,
+        u.Telefono,
+        u.PasswordHash,
+        u.Activo,
+        r.Codigo AS Rol
+    FROM dbo.Usuario u
+    INNER JOIN dbo.Rol r ON u.IDRol = r.IDRol
+    WHERE u.IDUsuario = @IDUsuario AND u.Activo = 1;
+END;
+GO
