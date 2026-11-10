@@ -10,6 +10,9 @@ router.post('/login', controller.login);
 router.post('/refresh', controller.refrescar);
 router.post('/logout', controller.logout);
 
+router.put('/perfil', autenticar, controller.actualizarPerfil);
+router.put('/cambiar-password', autenticar, controller.cambiarPassword);
+
 // Rutas protegidas de prueba
 router.get('/perfil', autenticar, controller.perfil);
 router.get('/solo-operador', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.perfil);

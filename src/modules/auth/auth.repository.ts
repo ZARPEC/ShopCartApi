@@ -142,4 +142,40 @@ export class AuthRepository {
       .execute("dbo.SP_Auth_CambiarEstadoUsuario");
     return result.recordset[0];
   }
+
+  async actualizarPerfil(
+    idUsuario: number,
+    nombres: string,
+    apellidos: string,
+    telefono?: string,
+  ) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDUsuario", sql.Int, idUsuario)
+      .input("Nombres", sql.NVarChar(100), nombres)
+      .input("Apellidos", sql.NVarChar(100), apellidos)
+      .input("Telefono", sql.VarChar(20), telefono ?? null)
+      .execute("dbo.SP_Auth_ActualizarPerfil");
+    return result.recordset[0];
+  }
+
+  async cambiarPassword(idUsuario: number, nuevoPasswordHash: string) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDUsuario", sql.Int, idUsuario)
+      .input("NuevoPasswordHash", sql.VarChar(255), nuevoPasswordHash)
+      .execute("dbo.SP_Auth_CambiarPassword");
+    return result.recordset[0];
+  }
+
+  async buscarPorId(idUsuario: number) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDUsuario", sql.Int, idUsuario)
+      .execute("dbo.SP_Auth_ObtenerUsuarioPorId");
+    return result.recordset[0];
+  }
 }

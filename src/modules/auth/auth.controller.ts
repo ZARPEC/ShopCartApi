@@ -76,9 +76,15 @@ export class AuthController {
     }
   };
 
-  perfil = async (req: Request, res: Response) => {
-    res.status(200).json({ ok: true, usuario: req.usuario });
-  };
+  perfil = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const repo = new AuthRepository();
+    const usuario = await repo.buscarPorId(req.usuario!.idUsuario);
+    res.status(200).json({ ok: true, usuario });
+  } catch (error) {
+    next(error);
+  }
+};
 
   crearEmpleado = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -120,6 +126,36 @@ cambiarEstadoUsuario = async (req: Request, res: Response, next: NextFunction) =
       req.ip
     );
     res.status(200).json({ ok: true, ...resultado });
+  } catch (error) {
+    next(error);
+  }
+};
+
+actualizarPerfil = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { nombres, apellidos, telefono } = req.body;
+    const repo = new AuthRepository();
+    const usuario = await repo.actualizarPerfil(req.usuario!.idUsuario, nombres, apellidos, telefono);
+    res.status(200).json({ ok: true, usuario });
+  } catch (error) {
+    next(error);
+  }
+};
+
+cambiarPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { passwordActual, passwordNuevo } = req.body;
+    const repo = new AuthRepository();
+    const usuario = await repo.buscarPorId(req.usuario!.idUsuario);
+
+    const passValido = await bcrypt.compare(passwordActual, usuario.PasswordHash);
+    if (!passValido) {
+      return res.status(400).json({ ok: false, mensaje: 'La contraseña actual no es correcta.' });
+    }
+
+    const nuevoHash = await bcrypt.hash(passwordNuevo, env.BCRYPT_SALT_ROUNDS);
+    await repo.cambiarPassword(req.usuario!.idUsuario, nuevoHash);
+    res.status(200).json({ ok: true, mensaje: 'Contraseña actualizada exitosamente.' });
   } catch (error) {
     next(error);
   }
