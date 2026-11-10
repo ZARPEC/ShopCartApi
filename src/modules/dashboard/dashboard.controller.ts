@@ -68,4 +68,32 @@ export class DashboardController {
       next(error);
     }
   };
+
+  
+listarDevolucionesPendientes = async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const repo = new DashboardRepository();
+    const devoluciones = await repo.listarDevolucionesPendientes();
+    res.status(200).json({ ok: true, devoluciones });
+  } catch (error) { next(error); }
+};
+
+aprobarDevolucion = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const idDevolucion = Number(req.params.id);
+    const repo = new DashboardRepository();
+    const resultado = await repo.aprobarDevolucion(idDevolucion, req.usuario!.idUsuario, req.ip);
+    res.status(200).json({ ok: true, ...resultado });
+  } catch (error) { next(error); }
+};
+
+rechazarDevolucion = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const idDevolucion = Number(req.params.id);
+    const { motivo } = req.body;
+    const repo = new DashboardRepository();
+    const resultado = await repo.rechazarDevolucion(idDevolucion, req.usuario!.idUsuario, motivo, req.ip);
+    res.status(200).json({ ok: true, ...resultado });
+  } catch (error) { next(error); }
+};
 }

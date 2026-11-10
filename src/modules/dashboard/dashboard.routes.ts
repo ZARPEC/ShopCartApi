@@ -11,4 +11,8 @@ router.get('/pedidos', autenticar, autorizarRoles('ADMINISTRADOR', 'OPERADOR'), 
 
 router.get('/bitacora', autenticar, autorizarRoles('ADMINISTRADOR'), controller.consultarBitacora);
 
+
+router.get('/devoluciones-pendientes', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.listarDevolucionesPendientes);
+router.post('/devoluciones/:id/aprobar', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.aprobarDevolucion);
+router.post('/devoluciones/:id/rechazar', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.rechazarDevolucion); 
 export default router;

@@ -169,4 +169,42 @@ export class CheckoutRepository {
       .execute("dbo.SP_Checkout_EstablecerDireccionPredeterminada");
     return result.recordset[0];
   }
+
+  async procesarDevolucion(
+    idPedido: number,
+    idOperador: number,
+    motivo: string,
+    lineas: Array<{ idPedidoDetalle: number; cantidad: number }>,
+    ip?: string,
+  ) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDPedido", sql.Int, idPedido)
+      .input("IDUsuarioOperador", sql.Int, idOperador)
+      .input("MotivoDevolucion", sql.NVarChar(500), motivo)
+      .input("LineasJson", sql.NVarChar(sql.MAX), JSON.stringify(lineas))
+      .input("DireccionIP", sql.VarChar(45), ip ?? null)
+      .execute("dbo.SP_Pedidos_ProcesarDevolucion");
+    return result.recordset[0];
+  }
+
+  async solicitarDevolucionCliente(
+    idPedido: number,
+    idUsuario: number,
+    motivo: string,
+    lineas: any[],
+    ip?: string,
+  ) {
+    const pool = await getDbPool();
+    const result = await pool
+      .request()
+      .input("IDPedido", sql.Int, idPedido)
+      .input("IDUsuarioCliente", sql.Int, idUsuario)
+      .input("MotivoDevolucion", sql.NVarChar(500), motivo)
+      .input("LineasJson", sql.NVarChar(sql.MAX), JSON.stringify(lineas))
+      .input("DireccionIP", sql.VarChar(45), ip ?? null)
+      .execute("dbo.SP_Pedidos_SolicitarDevolucionCliente");
+    return result.recordset[0];
+  }
 }

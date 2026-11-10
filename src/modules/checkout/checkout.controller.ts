@@ -198,4 +198,48 @@ export class CheckoutController {
       next(error);
     }
   };
+
+  procesarDevolucion = async (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ) => {
+    try {
+      const idPedido = Number(req.params.id);
+      const { motivo, lineas } = req.body;
+      const repo = new CheckoutRepository();
+      const resultado = await repo.procesarDevolucion(
+        idPedido,
+        req.usuario!.idUsuario,
+        motivo,
+        lineas,
+        req.ip,
+      );
+      res.status(200).json({ ok: true, ...resultado });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  solicitarDevolucion = async (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ) => {
+    try {
+      const idPedido = Number(req.params.id);
+      const { motivo, lineas } = req.body;
+      const repo = new CheckoutRepository();
+      const resultado = await repo.solicitarDevolucionCliente(
+        idPedido,
+        req.usuario!.idUsuario,
+        motivo,
+        lineas,
+        req.ip,
+      );
+      res.status(200).json({ ok: true, ...resultado });
+    } catch (error) {
+      next(error);
+    }
+  };
 }

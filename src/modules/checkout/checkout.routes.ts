@@ -17,9 +17,9 @@ router.post('/liberar-reserva', autenticar, controller.liberarReserva);
 
 router.get('/mis-pedidos', autenticar, controller.misPedidos);
 router.get('/mis-pedidos/:id', autenticar, controller.detalleMiPedido);
+router.post('/pedidos/:id/devolucion', autenticar, autorizarRoles('CLIENTE'), controller.solicitarDevolucion);
 
 router.post('/pedidos/:idPedido/cancelar', autenticar, autorizarRoles('CLIENTE', 'OPERADOR', 'ADMINISTRADOR'), controller.cancelarPedido);
 router.patch('/pedidos/:idPedido/estado', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.avanzarEstado);
-router.post('/pedidos/:idPedido/devolucion', autenticar, autorizarRoles('OPERADOR', 'ADMINISTRADOR'), controller.registrarDevolucion);
 
 export default router;
